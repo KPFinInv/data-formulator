@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Dots3 Desktop"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 KEYRING_SERVICE = "Dots3Desktop"
 KEYRING_USER = "OpenRouterAPIKey"
 DEFAULT_MODEL = "dots-studio/dots-3-note-preview:free"
@@ -47,7 +47,6 @@ def app_data_dir() -> Path:
     return path
 
 HISTORY_FILE = app_data_dir() / "history.json"
-SETTINGS_FILE = app_data_dir() / "settings.json"
 
 
 def safe_read_text(path: Path, max_chars: int = 120_000) -> str:
@@ -249,37 +248,68 @@ class MainWindow(QMainWindow):
 
     def default_messages(self): return [{"role": "system", "content": SYSTEM_PROMPT}]
 
+    def apply_theme(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background: #0b1020; color: #eaf0ff; font-family: 'Segoe UI'; }
+            QMenuBar { background: #11182b; color: #dce6ff; padding: 4px; }
+            QMenuBar::item:selected, QMenu::item:selected { background: #26355d; }
+            QMenu { background: #11182b; color: #eaf0ff; border: 1px solid #2a3658; }
+            QLabel#brand { color: #ffffff; font-weight: 700; }
+            QLabel#workspace { color: #8fb3ff; background: #101a33; border: 1px solid #24345d; border-radius: 8px; padding: 8px; }
+            QLabel#activity { color: #7dd3fc; padding: 3px 2px; }
+            QLabel#attachments { color: #c4b5fd; }
+            QListWidget { background: #10172a; border: 1px solid #263453; border-radius: 12px; padding: 6px; }
+            QListWidget::item { padding: 10px; margin: 2px; border-radius: 7px; }
+            QListWidget::item:selected { background: #243a78; color: white; }
+            QListWidget::item:hover { background: #18274d; }
+            QTextBrowser { background: #0f172a; border: 1px solid #263453; border-radius: 14px; padding: 14px; color: #e8eefc; }
+            QTextEdit, QLineEdit { background: #111827; color: #f8fafc; border: 1px solid #33446f; border-radius: 10px; padding: 9px; selection-background-color: #4f46e5; }
+            QTextEdit:focus, QLineEdit:focus { border: 1px solid #7c8cff; }
+            QPushButton { background: #1a2440; color: #eaf0ff; border: 1px solid #34466f; border-radius: 9px; padding: 8px 14px; font-weight: 600; }
+            QPushButton:hover { background: #24345d; border-color: #6680d8; }
+            QPushButton#primary { background: #6d5dfc; color: white; border: none; }
+            QPushButton#primary:hover { background: #7f70ff; }
+            QPushButton#newChat { background: #0ea5e9; color: white; border: none; }
+            QPushButton#newChat:hover { background: #38bdf8; }
+            QPushButton#danger { background: #3a1f2d; color: #fecdd3; border-color: #6f2c46; }
+            QCheckBox { spacing: 8px; color: #dbeafe; font-weight: 700; }
+            QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #5a6e9a; border-radius: 5px; background: #111827; }
+            QCheckBox::indicator:checked { background: #22c55e; border-color: #22c55e; }
+            QStatusBar { background: #10172a; color: #93c5fd; border-top: 1px solid #263453; }
+            QSplitter::handle { background: #1b2848; width: 2px; }
+        """)
+
     def build_ui(self):
         root = QWidget(); self.setCentralWidget(root)
-        outer = QVBoxLayout(root)
+        outer = QVBoxLayout(root); outer.setContentsMargins(14, 12, 14, 12); outer.setSpacing(10)
         toolbar = QHBoxLayout()
-        brand = QLabel("●  Dots3 Desktop"); brand.setFont(QFont("Segoe UI", 16, QFont.Weight.DemiBold)); toolbar.addWidget(brand)
+        brand = QLabel("✦  Dots3 Desktop"); brand.setObjectName("brand"); brand.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold)); toolbar.addWidget(brand)
         toolbar.addStretch(1)
-        self.agent_mode = QCheckBox("Agent Mode"); toolbar.addWidget(self.agent_mode)
-        ws = QPushButton("Workspace"); ws.clicked.connect(self.choose_workspace); toolbar.addWidget(ws)
-        st = QPushButton("Settings"); st.clicked.connect(self.open_settings); toolbar.addWidget(st)
+        self.agent_mode = QCheckBox("Agent Mode"); self.agent_mode.setChecked(True); toolbar.addWidget(self.agent_mode)
+        ws = QPushButton("📁  Workspace"); ws.clicked.connect(self.choose_workspace); toolbar.addWidget(ws)
+        st = QPushButton("⚙  Settings"); st.clicked.connect(self.open_settings); toolbar.addWidget(st)
         outer.addLayout(toolbar)
 
         split = QSplitter(Qt.Orientation.Horizontal)
-        side = QWidget(); side_l = QVBoxLayout(side)
-        new_btn = QPushButton("+ New Chat"); new_btn.clicked.connect(self.new_chat); side_l.addWidget(new_btn)
+        side = QWidget(); side_l = QVBoxLayout(side); side_l.setContentsMargins(0, 0, 8, 0)
+        new_btn = QPushButton("＋  New Chat"); new_btn.setObjectName("newChat"); new_btn.clicked.connect(self.new_chat); side_l.addWidget(new_btn)
         self.history = QListWidget(); self.history.itemClicked.connect(lambda i: self.load_session(i.data(Qt.ItemDataRole.UserRole))); self.history.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.history.customContextMenuRequested.connect(self.history_menu); side_l.addWidget(self.history, 1)
         split.addWidget(side)
 
-        main = QWidget(); main_l = QVBoxLayout(main)
-        self.workspace_label = QLabel("Workspace: none"); self.workspace_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); main_l.addWidget(self.workspace_label)
-        self.chat = QTextBrowser(); self.chat.setOpenExternalLinks(True); self.chat.setStyleSheet("QTextBrowser{padding:16px;font-size:14px;border-radius:8px;} "); main_l.addWidget(self.chat, 1)
-        self.activity = QLabel(""); self.activity.setStyleSheet("color:#777;font-size:12px;"); main_l.addWidget(self.activity)
-        self.attachment_label = QLabel("No attachments"); main_l.addWidget(self.attachment_label)
+        main = QWidget(); main_l = QVBoxLayout(main); main_l.setContentsMargins(8, 0, 0, 0); main_l.setSpacing(8)
+        self.workspace_label = QLabel("Workspace: none"); self.workspace_label.setObjectName("workspace"); self.workspace_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); main_l.addWidget(self.workspace_label)
+        self.chat = QTextBrowser(); self.chat.setOpenExternalLinks(True); main_l.addWidget(self.chat, 1)
+        self.activity = QLabel(""); self.activity.setObjectName("activity"); main_l.addWidget(self.activity)
+        self.attachment_label = QLabel("No attachments"); self.attachment_label.setObjectName("attachments"); main_l.addWidget(self.attachment_label)
         self.input = QTextEdit(); self.input.setPlaceholderText("Ask dots3 anything...  (Ctrl+Enter to send)"); self.input.setMaximumHeight(145); main_l.addWidget(self.input)
-        row = QHBoxLayout();
-        a = QPushButton("Attach"); a.clicked.connect(self.attach_files); row.addWidget(a)
+        row = QHBoxLayout()
+        a = QPushButton("📎  Attach"); a.clicked.connect(self.attach_files); row.addWidget(a)
         ca = QPushButton("Clear Attachments"); ca.clicked.connect(self.clear_attachments); row.addWidget(ca)
         row.addStretch(1)
-        self.stop_btn = QPushButton("Stop"); self.stop_btn.setEnabled(False); self.stop_btn.clicked.connect(self.stop_worker); row.addWidget(self.stop_btn)
-        self.send_btn = QPushButton("Send"); self.send_btn.clicked.connect(self.send_message); row.addWidget(self.send_btn)
-        main_l.addLayout(row); split.addWidget(main); split.setSizes([250, 950]); outer.addWidget(split, 1)
-        self.statusBar().showMessage("Ready")
+        self.stop_btn = QPushButton("Stop"); self.stop_btn.setObjectName("danger"); self.stop_btn.setEnabled(False); self.stop_btn.clicked.connect(self.stop_worker); row.addWidget(self.stop_btn)
+        self.send_btn = QPushButton("Send  ➜"); self.send_btn.setObjectName("primary"); self.send_btn.clicked.connect(self.send_message); row.addWidget(self.send_btn)
+        main_l.addLayout(row); split.addWidget(main); split.setSizes([255, 965]); outer.addWidget(split, 1)
+        self.statusBar().showMessage("Agent Mode ready")
 
         menu = self.menuBar().addMenu("App")
         act_new = QAction("New Chat", self); act_new.triggered.connect(self.new_chat); menu.addAction(act_new)
@@ -288,7 +318,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator(); about = QAction("About", self); about.triggered.connect(lambda: QMessageBox.information(self, APP_NAME, f"{APP_NAME} v{APP_VERSION}\nPowered through OpenRouter + dots3.")); menu.addAction(about)
         QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.send_message)
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self.new_chat)
-        self.refresh_history()
+        self.apply_theme(); self.refresh_history()
 
     def refresh_history(self):
         self.history.clear()
@@ -325,7 +355,7 @@ class MainWindow(QMainWindow):
         self.persist_current(); s = self.sessions.get(sid)
         if not s: return
         self.current_id = sid; self.messages = s.get("messages", self.default_messages()); self.model = s.get("model", self.model); self.workspace = s.get("workspace") or None; self.workspace_label.setText(f"Workspace: {self.workspace or 'none'}")
-        self.chat.clear();
+        self.chat.clear()
         for m in self.messages:
             if m.get("role") not in ("user", "assistant"): continue
             c = m.get("content", "")
@@ -333,8 +363,16 @@ class MainWindow(QMainWindow):
             self.append_chat("You" if m.get("role") == "user" else "Dots3", str(c))
         self.refresh_history()
 
-    def render_welcome(self): self.chat.setHtml("<h2>Welcome to Dots3 Desktop</h2><p>Connect OpenRouter in <b>Settings</b>. Your chats are saved locally on this PC.</p><p><b>Agent Mode</b> can search the web and inspect files only inside a workspace folder you choose.</p>")
-    def append_chat(self, who, text): self.chat.append(f"<div style='margin:10px 0'><b>{who}</b><br>{html_escape(text)}</div>")
+    def render_welcome(self):
+        self.chat.setHtml("<div style='padding:18px'><h2 style='color:#a5b4fc'>Welcome to Dots3 Desktop</h2><p style='font-size:14px'>Agent Mode is enabled by default, so dots3 can use web search and workspace tools when useful.</p><p><b style='color:#7dd3fc'>Tip:</b> choose a workspace folder to let the agent inspect only the files you explicitly allow.</p></div>")
+
+    def append_chat(self, who, text):
+        if who == "You":
+            self.chat.append(f"<div style='margin:14px 0 14px 18%; padding:12px 14px; background:#243a78; border-radius:12px; color:#f8fbff'><b style='color:#bfdbfe'>You</b><br>{html_escape(text)}</div>")
+        elif who == "Dots3":
+            self.chat.append(f"<div style='margin:14px 18% 14px 0; padding:12px 14px; background:#172554; border:1px solid #314a92; border-radius:12px; color:#eef2ff'><b style='color:#c4b5fd'>✦ Dots3</b><br>{html_escape(text)}</div>")
+        else:
+            self.chat.append(f"<div style='margin:12px 0; padding:10px; background:#3f1d2e; border-radius:10px; color:#fecdd3'><b>{who}</b><br>{html_escape(text)}</div>")
 
     def open_settings(self):
         dlg = SettingsDialog(self, self.model)
@@ -350,6 +388,7 @@ class MainWindow(QMainWindow):
         for f in files:
             if Path(f).suffix.lower() in TEXT_EXTENSIONS | IMAGE_EXTENSIONS | {".pdf"} and f not in self.attachments: self.attachments.append(f)
         self.update_attachment_label()
+
     def clear_attachments(self): self.attachments=[]; self.update_attachment_label()
     def update_attachment_label(self): self.attachment_label.setText("Attachments: " + ", ".join(Path(x).name for x in self.attachments) if self.attachments else "No attachments")
 
