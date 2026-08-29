@@ -1,4 +1,4 @@
-name: Build Dots3 Windows EXE
+name: Build Dots3 Windows Installer
 
 on:
   push:
@@ -30,21 +30,52 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pillow
 
-      - name: Build single Windows EXE
+      - name: Generate application icon
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name Dots3Desktop --collect-all keyring --collect-all keyring.backends --collect-all ddgs app.py
+          @'
+          from PIL import Image, ImageDraw, ImageFont
+          img=Image.new('RGBA',(256,256),(20,24,32,255))
+          d=ImageDraw.Draw(img)
+          d.ellipse((34,34,222,222), fill=(85,92,255,255))
+          d.ellipse((76,76,180,180), fill=(20,24,32,255))
+          d.ellipse((104,104,152,152), fill=(255,255,255,255))
+          img.save('dots3.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
+          '@ | python
 
-      - name: Verify EXE
+      - name: Build portable EXE
         shell: pwsh
         run: |
-          if (!(Test-Path "dist\Dots3Desktop.exe")) { throw "Dots3Desktop.exe was not created" }
-          Get-Item "dist\Dots3Desktop.exe" | Format-List Name,Length,LastWriteTime
+          pyinstaller --noconfirm --clean --onefile --windowed --name Dots3Desktop --icon dots3.ico --add-data "dots3.ico;." --collect-all keyring --collect-all keyring.backends --collect-all ddgs app.py
 
-      - name: Upload EXE artifact
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Verify outputs
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\Dots3Desktop.exe")) { throw "Portable EXE was not created" }
+          if (!(Test-Path "installer-output\Dots3Desktop-Setup.exe")) { throw "Installer was not created" }
+          Get-Item "dist\Dots3Desktop.exe", "installer-output\Dots3Desktop-Setup.exe" | Format-List Name,Length,LastWriteTime
+
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Dots3Desktop-Windows-EXE
+          name: Dots3Desktop-Windows-Installer
+          path: tools/dots3-desktop/installer-output/Dots3Desktop-Setup.exe
+          if-no-files-found: error
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dots3Desktop-Windows-Portable
           path: tools/dots3-desktop/dist/Dots3Desktop.exe
           if-no-files-found: error
