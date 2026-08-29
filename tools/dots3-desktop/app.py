@@ -1,56 +1,84 @@
 import base64
 import json
 import mimetypes
+import os
 import sys
 import traceback
+import uuid
+import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 import keyring
 import requests
 from ddgs import DDGS
 from pypdf import PdfReader
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QCheckBox, QDialog, QDialogButtonBox,
-    QFormLayout, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMainWindow, QMessageBox, QPushButton, QCheckBox, QDialog,
+    QDialogButtonBox, QFormLayout, QTextBrowser, QTextEdit, QVBoxLayout,
+    QWidget, QSplitter, QMenu
 )
 
 APP_NAME = "Dots3 Desktop"
+APP_VERSION = "1.1.0"
 KEYRING_SERVICE = "Dots3Desktop"
 KEYRING_USER = "OpenRouterAPIKey"
 DEFAULT_MODEL = "dots-studio/dots-3-note-preview:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+RELEASES_API = "https://api.github.com/repos/KPFinInv/data-formulator/releases"
+RELEASE_TAG_PREFIX = "dots3-desktop-v"
 
-TEXT_EXTENSIONS = {
-    ".txt", ".md", ".csv", ".json", ".py", ".sql", ".xml", ".yaml", ".yml",
-    ".html", ".htm", ".js", ".ts", ".tsx", ".jsx", ".css", ".ini", ".log"
-}
+TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".py", ".sql", ".xml", ".yaml", ".yml", ".html", ".htm", ".js", ".ts", ".tsx", ".jsx", ".css", ".ini", ".log"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+SYSTEM_PROMPT = (
+    "You are Dots3 Desktop, a capable assistant. Be concise but complete. "
+    "When Agent Mode is enabled, use tools when they materially improve the answer. "
+    "Never claim to have read a local file unless a tool or attachment supplied its content."
+)
+
+
+def app_data_dir() -> Path:
+    root = Path(os.getenv("APPDATA") or Path.home() / ".dots3-desktop")
+    path = root / "Dots3Desktop"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+HISTORY_FILE = app_data_dir() / "history.json"
+SETTINGS_FILE = app_data_dir() / "settings.json"
 
 
 def safe_read_text(path: Path, max_chars: int = 120_000) -> str:
     if path.suffix.lower() == ".pdf":
         reader = PdfReader(str(path))
-        text = "\n".join((page.extract_text() or "") for page in reader.pages)
-        return text[:max_chars]
+        return "\n".join((page.extract_text() or "") for page in reader.pages)[:max_chars]
     return path.read_text(encoding="utf-8", errors="replace")[:max_chars]
 
 
 def to_data_url(path: Path) -> str:
     mime, _ = mimetypes.guess_type(path.name)
-    if not mime:
-        mime = "image/png"
     data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{data}"
+    return f"data:{mime or 'image/png'};base64,{data}"
+
+
+def html_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+
+
+def version_tuple(v: str):
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except Exception:
+        return (0,)
 
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None, model=DEFAULT_MODEL):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(520, 150)
+        self.resize(560, 180)
         layout = QFormLayout(self)
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -70,10 +98,39 @@ class SettingsDialog(QDialog):
         return self.model.text().strip() or DEFAULT_MODEL
 
 
+class UpdateWorker(QThread):
+    found = Signal(str, str)
+    none = Signal()
+
+    def run(self):
+        try:
+            r = requests.get(RELEASES_API, timeout=12)
+            r.raise_for_status()
+            for rel in r.json():
+                tag = rel.get("tag_name", "")
+                if not tag.startswith(RELEASE_TAG_PREFIX):
+                    continue
+                ver = tag[len(RELEASE_TAG_PREFIX):]
+                if version_tuple(ver) > version_tuple(APP_VERSION):
+                    asset_url = rel.get("html_url", "")
+                    for asset in rel.get("assets", []):
+                        if asset.get("name", "").lower().endswith("setup.exe"):
+                            asset_url = asset.get("browser_download_url", asset_url)
+                            break
+                    self.found.emit(ver, asset_url)
+                else:
+                    self.none.emit()
+                return
+            self.none.emit()
+        except Exception:
+            self.none.emit()
+
+
 class ChatWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
     status = Signal(str)
+    activity = Signal(str)
 
     def __init__(self, messages, model, api_key, agent_mode=False, workspace=None):
         super().__init__()
@@ -85,110 +142,81 @@ class ChatWorker(QThread):
         self.cancelled = False
 
     def request(self, messages, tools=None):
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://localhost/dots3-desktop",
-            "X-Title": APP_NAME,
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "HTTP-Referer": "https://localhost/dots3-desktop", "X-Title": APP_NAME}
         payload = {"model": self.model, "messages": messages, "temperature": 0.2}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=180)
-        if not response.ok:
-            raise RuntimeError(f"OpenRouter error {response.status_code}: {response.text[:1000]}")
-        return response.json()["choices"][0]["message"]
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=180)
+        if not r.ok:
+            raise RuntimeError(f"OpenRouter error {r.status_code}: {r.text[:1000]}")
+        return r.json()["choices"][0]["message"]
 
     def tools_schema(self):
         return [
-            {"type": "function", "function": {
-                "name": "web_search", "description": "Search the public web for current information.",
-                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
-            }},
-            {"type": "function", "function": {
-                "name": "list_workspace_files", "description": "List files inside the selected local workspace folder.",
-                "parameters": {"type": "object", "properties": {"relative_path": {"type": "string", "default": "."}}}
-            }},
-            {"type": "function", "function": {
-                "name": "read_workspace_file", "description": "Read a text or PDF file inside the selected workspace folder.",
-                "parameters": {"type": "object", "properties": {"relative_path": {"type": "string"}}, "required": ["relative_path"]}
-            }},
+            {"type": "function", "function": {"name": "web_search", "description": "Search the public web for current information.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+            {"type": "function", "function": {"name": "list_workspace_files", "description": "List files inside the selected local workspace folder.", "parameters": {"type": "object", "properties": {"relative_path": {"type": "string", "default": "."}}}}},
+            {"type": "function", "function": {"name": "read_workspace_file", "description": "Read a text or PDF file inside the selected workspace folder.", "parameters": {"type": "object", "properties": {"relative_path": {"type": "string"}}, "required": ["relative_path"]}}},
         ]
 
     def _workspace_path(self, rel: str) -> Path:
         if not self.workspace:
             raise RuntimeError("No workspace folder selected.")
-        candidate = (self.workspace / rel).resolve()
+        p = (self.workspace / rel).resolve()
         try:
-            candidate.relative_to(self.workspace)
+            p.relative_to(self.workspace)
         except ValueError:
             raise RuntimeError("Access denied: path is outside the selected workspace.")
-        return candidate
+        return p
 
     def run_tool(self, name, args):
         if name == "web_search":
-            self.status.emit("Searching the web...")
             query = str(args.get("query", "")).strip()
-            if not query:
-                return "No query provided."
-            results = list(DDGS().text(query, max_results=6))
-            compact = [{"title": r.get("title"), "href": r.get("href"), "body": r.get("body")} for r in results]
-            return json.dumps(compact, ensure_ascii=False)
+            self.activity.emit(f"Web search: {query}")
+            results = list(DDGS().text(query, max_results=6)) if query else []
+            return json.dumps([{"title": r.get("title"), "href": r.get("href"), "body": r.get("body")} for r in results], ensure_ascii=False)
         if name == "list_workspace_files":
             rel = args.get("relative_path", ".") or "."
+            self.activity.emit(f"Listing workspace: {rel}")
             p = self._workspace_path(rel)
-            if not p.exists():
-                return "Path does not exist."
-            if p.is_file():
-                return str(p.relative_to(self.workspace))
-            items = []
-            for child in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:200]:
-                marker = "[DIR]" if child.is_dir() else "[FILE]"
-                items.append(f"{marker} {child.relative_to(self.workspace)}")
-            return "\n".join(items)
+            if not p.exists(): return "Path does not exist."
+            if p.is_file(): return str(p.relative_to(self.workspace))
+            return "\n".join(("[DIR] " if c.is_dir() else "[FILE] ") + str(c.relative_to(self.workspace)) for c in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:200])
         if name == "read_workspace_file":
             rel = args.get("relative_path", "")
+            self.activity.emit(f"Reading file: {rel}")
             p = self._workspace_path(rel)
-            if not p.exists() or not p.is_file():
-                return "File does not exist."
-            if p.suffix.lower() not in TEXT_EXTENSIONS | {".pdf"}:
-                return "Unsupported file type for text reading."
-            return safe_read_text(p, max_chars=100_000)
+            if not p.exists() or not p.is_file(): return "File does not exist."
+            if p.suffix.lower() not in TEXT_EXTENSIONS | {".pdf"}: return "Unsupported file type for text reading."
+            return safe_read_text(p, 100_000)
         return f"Unknown tool: {name}"
 
     def run(self):
         try:
             self.status.emit("Thinking...")
             if not self.agent_mode:
-                reply = self.request(self.messages)
-                self.done.emit(reply.get("content") or "")
+                self.done.emit(self.request(self.messages).get("content") or "")
                 return
-            messages = list(self.messages)
-            tools = self.tools_schema()
-            for _ in range(8):
+            messages, tools = list(self.messages), self.tools_schema()
+            for step in range(10):
                 if self.cancelled:
                     self.failed.emit("Stopped.")
                     return
-                reply = self.request(messages, tools=tools)
+                self.status.emit(f"Agent step {step + 1}/10")
+                reply = self.request(messages, tools)
                 messages.append(reply)
-                tool_calls = reply.get("tool_calls") or []
-                if not tool_calls:
+                calls = reply.get("tool_calls") or []
+                if not calls:
                     self.done.emit(reply.get("content") or "")
                     return
-                for call in tool_calls:
+                for call in calls:
                     fn = call.get("function", {})
-                    name = fn.get("name", "")
-                    try:
-                        args = json.loads(fn.get("arguments") or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
-                    try:
-                        output = self.run_tool(name, args)
-                    except Exception as e:
-                        output = f"Tool error: {e}"
+                    try: args = json.loads(fn.get("arguments") or "{}")
+                    except Exception: args = {}
+                    try: output = self.run_tool(fn.get("name", ""), args)
+                    except Exception as e: output = f"Tool error: {e}"
                     messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": output})
-            self.done.emit("Agent stopped after reaching the tool-step limit. Please continue with a narrower request.")
+            self.done.emit("Agent reached its step limit. Continue with a narrower follow-up if needed.")
         except Exception as e:
             self.failed.emit(f"{e}\n\n{traceback.format_exc(limit=2)}")
 
@@ -196,194 +224,173 @@ class ChatWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
-        self.resize(1040, 760)
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        self.resize(1220, 820)
+        icon = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "dots3.ico"
+        if icon.exists(): self.setWindowIcon(QIcon(str(icon)))
         self.model = DEFAULT_MODEL
         self.workspace = None
         self.attachments = []
-        self.messages = [{"role": "system", "content": (
-            "You are Dots3 Desktop, a capable assistant. Be concise but complete. "
-            "When Agent Mode is enabled, use tools when they materially improve the answer. "
-            "Never claim to have read a local file unless a tool or attachment supplied its content."
-        )}]
         self.worker = None
+        self.sessions = self.load_history()
+        self.current_id = None
         self.build_ui()
+        self.new_chat(save_old=False) if not self.sessions else self.load_session(next(iter(self.sessions)))
+        QTimer.singleShot(3000, self.check_updates_silent)
+
+    def load_history(self):
+        try:
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8")) if HISTORY_FILE.exists() else {}
+            return data if isinstance(data, dict) else {}
+        except Exception: return {}
+
+    def save_history(self):
+        HISTORY_FILE.write_text(json.dumps(self.sessions, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def default_messages(self): return [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def build_ui(self):
-        root = QWidget()
-        self.setCentralWidget(root)
+        root = QWidget(); self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        top = QHBoxLayout()
-        title = QLabel("Dots3 Desktop")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.DemiBold))
-        top.addWidget(title)
-        top.addStretch(1)
-        self.agent_mode = QCheckBox("Agent Mode")
-        top.addWidget(self.agent_mode)
-        self.workspace_btn = QPushButton("Choose Workspace")
-        self.workspace_btn.clicked.connect(self.choose_workspace)
-        top.addWidget(self.workspace_btn)
-        settings_btn = QPushButton("Settings")
-        settings_btn.clicked.connect(self.open_settings)
-        top.addWidget(settings_btn)
-        outer.addLayout(top)
-        self.workspace_label = QLabel("Workspace: none")
-        self.workspace_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        outer.addWidget(self.workspace_label)
-        self.chat = QTextBrowser()
-        self.chat.setOpenExternalLinks(True)
-        self.chat.setStyleSheet("QTextBrowser { padding: 12px; font-size: 14px; }")
-        outer.addWidget(self.chat, 1)
-        self.attachment_label = QLabel("No attachments")
-        outer.addWidget(self.attachment_label)
-        self.input = QTextEdit()
-        self.input.setPlaceholderText("Ask dots3 anything...")
-        self.input.setMaximumHeight(140)
-        outer.addWidget(self.input)
-        actions = QHBoxLayout()
-        attach_btn = QPushButton("Attach Files")
-        attach_btn.clicked.connect(self.attach_files)
-        actions.addWidget(attach_btn)
-        clear_attach_btn = QPushButton("Clear Attachments")
-        clear_attach_btn.clicked.connect(self.clear_attachments)
-        actions.addWidget(clear_attach_btn)
-        reset_btn = QPushButton("New Chat")
-        reset_btn.clicked.connect(self.reset_chat)
-        actions.addWidget(reset_btn)
-        actions.addStretch(1)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop_worker)
-        actions.addWidget(self.stop_btn)
-        self.send_btn = QPushButton("Send")
-        self.send_btn.clicked.connect(self.send_message)
-        actions.addWidget(self.send_btn)
-        outer.addLayout(actions)
-        self.statusBar().showMessage("Ready")
-        settings_action = QAction("Settings", self)
-        settings_action.triggered.connect(self.open_settings)
-        self.menuBar().addAction(settings_action)
-        self.render_welcome()
+        toolbar = QHBoxLayout()
+        brand = QLabel("●  Dots3 Desktop"); brand.setFont(QFont("Segoe UI", 16, QFont.Weight.DemiBold)); toolbar.addWidget(brand)
+        toolbar.addStretch(1)
+        self.agent_mode = QCheckBox("Agent Mode"); toolbar.addWidget(self.agent_mode)
+        ws = QPushButton("Workspace"); ws.clicked.connect(self.choose_workspace); toolbar.addWidget(ws)
+        st = QPushButton("Settings"); st.clicked.connect(self.open_settings); toolbar.addWidget(st)
+        outer.addLayout(toolbar)
 
-    def render_welcome(self):
-        self.chat.setHtml("<h2>Welcome to Dots3 Desktop</h2><p>Connect your OpenRouter API key in <b>Settings</b>, then chat normally.</p><p><b>Agent Mode</b> can search the web and inspect files inside a workspace folder you choose.</p>")
+        split = QSplitter(Qt.Orientation.Horizontal)
+        side = QWidget(); side_l = QVBoxLayout(side)
+        new_btn = QPushButton("+ New Chat"); new_btn.clicked.connect(self.new_chat); side_l.addWidget(new_btn)
+        self.history = QListWidget(); self.history.itemClicked.connect(lambda i: self.load_session(i.data(Qt.ItemDataRole.UserRole))); self.history.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.history.customContextMenuRequested.connect(self.history_menu); side_l.addWidget(self.history, 1)
+        split.addWidget(side)
+
+        main = QWidget(); main_l = QVBoxLayout(main)
+        self.workspace_label = QLabel("Workspace: none"); self.workspace_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); main_l.addWidget(self.workspace_label)
+        self.chat = QTextBrowser(); self.chat.setOpenExternalLinks(True); self.chat.setStyleSheet("QTextBrowser{padding:16px;font-size:14px;border-radius:8px;} "); main_l.addWidget(self.chat, 1)
+        self.activity = QLabel(""); self.activity.setStyleSheet("color:#777;font-size:12px;"); main_l.addWidget(self.activity)
+        self.attachment_label = QLabel("No attachments"); main_l.addWidget(self.attachment_label)
+        self.input = QTextEdit(); self.input.setPlaceholderText("Ask dots3 anything...  (Ctrl+Enter to send)"); self.input.setMaximumHeight(145); main_l.addWidget(self.input)
+        row = QHBoxLayout();
+        a = QPushButton("Attach"); a.clicked.connect(self.attach_files); row.addWidget(a)
+        ca = QPushButton("Clear Attachments"); ca.clicked.connect(self.clear_attachments); row.addWidget(ca)
+        row.addStretch(1)
+        self.stop_btn = QPushButton("Stop"); self.stop_btn.setEnabled(False); self.stop_btn.clicked.connect(self.stop_worker); row.addWidget(self.stop_btn)
+        self.send_btn = QPushButton("Send"); self.send_btn.clicked.connect(self.send_message); row.addWidget(self.send_btn)
+        main_l.addLayout(row); split.addWidget(main); split.setSizes([250, 950]); outer.addWidget(split, 1)
+        self.statusBar().showMessage("Ready")
+
+        menu = self.menuBar().addMenu("App")
+        act_new = QAction("New Chat", self); act_new.triggered.connect(self.new_chat); menu.addAction(act_new)
+        act_settings = QAction("Settings", self); act_settings.triggered.connect(self.open_settings); menu.addAction(act_settings)
+        act_update = QAction("Check for Updates", self); act_update.triggered.connect(lambda: self.check_updates(False)); menu.addAction(act_update)
+        menu.addSeparator(); about = QAction("About", self); about.triggered.connect(lambda: QMessageBox.information(self, APP_NAME, f"{APP_NAME} v{APP_VERSION}\nPowered through OpenRouter + dots3.")); menu.addAction(about)
+        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.send_message)
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=self.new_chat)
+        self.refresh_history()
+
+    def refresh_history(self):
+        self.history.clear()
+        ordered = sorted(self.sessions.items(), key=lambda kv: kv[1].get("updated", ""), reverse=True)
+        for sid, s in ordered:
+            from PySide6.QtWidgets import QListWidgetItem
+            item = QListWidgetItem(s.get("title", "New Chat")); item.setData(Qt.ItemDataRole.UserRole, sid); self.history.addItem(item)
+
+    def history_menu(self, pos):
+        item = self.history.itemAt(pos)
+        if not item: return
+        menu = QMenu(self); delete = menu.addAction("Delete Chat")
+        if menu.exec(self.history.mapToGlobal(pos)) == delete:
+            sid = item.data(Qt.ItemDataRole.UserRole); self.sessions.pop(sid, None); self.save_history(); self.refresh_history()
+            if sid == self.current_id: self.new_chat(save_old=False)
+
+    def persist_current(self):
+        if not self.current_id: return
+        s = self.sessions.setdefault(self.current_id, {})
+        s.update({"messages": self.messages, "updated": datetime.utcnow().isoformat(), "model": self.model, "workspace": self.workspace})
+        user_texts = [m.get("content") for m in self.messages if m.get("role") == "user"]
+        if user_texts:
+            first = user_texts[0]
+            if isinstance(first, list): first = next((x.get("text", "") for x in first if x.get("type") == "text"), "")
+            s["title"] = str(first).strip().replace("\n", " ")[:42] or "New Chat"
+        else: s["title"] = "New Chat"
+        self.save_history(); self.refresh_history()
+
+    def new_chat(self, save_old=True):
+        if save_old: self.persist_current()
+        self.current_id = str(uuid.uuid4()); self.messages = self.default_messages(); self.sessions[self.current_id] = {"title":"New Chat","messages":self.messages,"updated":datetime.utcnow().isoformat(),"model":self.model,"workspace":self.workspace}; self.chat.clear(); self.render_welcome(); self.save_history(); self.refresh_history()
+
+    def load_session(self, sid):
+        self.persist_current(); s = self.sessions.get(sid)
+        if not s: return
+        self.current_id = sid; self.messages = s.get("messages", self.default_messages()); self.model = s.get("model", self.model); self.workspace = s.get("workspace") or None; self.workspace_label.setText(f"Workspace: {self.workspace or 'none'}")
+        self.chat.clear();
+        for m in self.messages:
+            if m.get("role") not in ("user", "assistant"): continue
+            c = m.get("content", "")
+            if isinstance(c, list): c = next((x.get("text", "") for x in c if x.get("type") == "text"), "")
+            self.append_chat("You" if m.get("role") == "user" else "Dots3", str(c))
+        self.refresh_history()
+
+    def render_welcome(self): self.chat.setHtml("<h2>Welcome to Dots3 Desktop</h2><p>Connect OpenRouter in <b>Settings</b>. Your chats are saved locally on this PC.</p><p><b>Agent Mode</b> can search the web and inspect files only inside a workspace folder you choose.</p>")
+    def append_chat(self, who, text): self.chat.append(f"<div style='margin:10px 0'><b>{who}</b><br>{html_escape(text)}</div>")
 
     def open_settings(self):
         dlg = SettingsDialog(self, self.model)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.model = dlg.save()
-            self.statusBar().showMessage(f"Model: {self.model}")
+            self.model = dlg.save(); self.persist_current(); self.statusBar().showMessage(f"Model: {self.model}")
 
     def choose_workspace(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose workspace folder")
-        if folder:
-            self.workspace = folder
-            self.workspace_label.setText(f"Workspace: {folder}")
+        if folder: self.workspace = folder; self.workspace_label.setText(f"Workspace: {folder}"); self.persist_current()
 
     def attach_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Attach files", "", "Supported (*.txt *.md *.csv *.json *.py *.sql *.pdf *.png *.jpg *.jpeg *.webp);;All files (*.*)")
         for f in files:
-            p = Path(f)
-            if p.suffix.lower() in TEXT_EXTENSIONS | IMAGE_EXTENSIONS | {".pdf"} and f not in self.attachments:
-                self.attachments.append(f)
+            if Path(f).suffix.lower() in TEXT_EXTENSIONS | IMAGE_EXTENSIONS | {".pdf"} and f not in self.attachments: self.attachments.append(f)
         self.update_attachment_label()
-
-    def clear_attachments(self):
-        self.attachments = []
-        self.update_attachment_label()
-
-    def update_attachment_label(self):
-        if not self.attachments:
-            self.attachment_label.setText("No attachments")
-        else:
-            self.attachment_label.setText("Attachments: " + ", ".join(Path(x).name for x in self.attachments))
+    def clear_attachments(self): self.attachments=[]; self.update_attachment_label()
+    def update_attachment_label(self): self.attachment_label.setText("Attachments: " + ", ".join(Path(x).name for x in self.attachments) if self.attachments else "No attachments")
 
     def make_user_content(self, text):
-        content = [{"type": "text", "text": text}]
+        content = [{"type":"text","text":text}]
         for f in self.attachments:
-            p = Path(f)
-            ext = p.suffix.lower()
+            p=Path(f); ext=p.suffix.lower()
             try:
-                if ext in IMAGE_EXTENSIONS:
-                    content.append({"type": "image_url", "image_url": {"url": to_data_url(p)}})
-                elif ext in TEXT_EXTENSIONS | {".pdf"}:
-                    extracted = safe_read_text(p)
-                    content.append({"type": "text", "text": f"\n--- Attached file: {p.name} ---\n{extracted}\n--- End file ---"})
-            except Exception as e:
-                content.append({"type": "text", "text": f"Could not read attachment {p.name}: {e}"})
+                if ext in IMAGE_EXTENSIONS: content.append({"type":"image_url","image_url":{"url":to_data_url(p)}})
+                elif ext in TEXT_EXTENSIONS | {".pdf"}: content.append({"type":"text","text":f"\n--- Attached file: {p.name} ---\n{safe_read_text(p)}\n--- End file ---"})
+            except Exception as e: content.append({"type":"text","text":f"Could not read attachment {p.name}: {e}"})
         return content
 
-    def append_chat(self, who, text):
-        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
-        self.chat.append(f"<p><b>{who}</b><br>{safe}</p>")
-
     def send_message(self):
-        text = self.input.toPlainText().strip()
-        if not text:
-            return
-        api_key = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
-        if not api_key:
-            QMessageBox.information(self, APP_NAME, "Add your OpenRouter API key in Settings first.")
-            self.open_settings()
-            return
-        if self.agent_mode.isChecked() and not self.workspace:
-            answer = QMessageBox.question(self, APP_NAME, "Agent Mode works best with a workspace folder. Continue with web search only?")
-            if answer != QMessageBox.StandardButton.Yes:
-                self.choose_workspace()
-        content = self.make_user_content(text)
-        self.messages.append({"role": "user", "content": content})
-        self.append_chat("You", text)
-        if self.attachments:
-            self.chat.append(f"<p><i>Attached: {', '.join(Path(x).name for x in self.attachments)}</i></p>")
-        self.input.clear()
-        self.attachments = []
-        self.update_attachment_label()
-        self.send_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.statusBar().showMessage("Working...")
-        self.worker = ChatWorker(list(self.messages), self.model, api_key, self.agent_mode.isChecked(), self.workspace)
-        self.worker.status.connect(self.statusBar().showMessage)
-        self.worker.done.connect(self.on_reply)
-        self.worker.failed.connect(self.on_error)
-        self.worker.start()
+        text=self.input.toPlainText().strip()
+        if not text or self.worker: return
+        key=keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+        if not key: QMessageBox.information(self,APP_NAME,"Add your OpenRouter API key in Settings first."); self.open_settings(); return
+        content=self.make_user_content(text); self.messages.append({"role":"user","content":content}); self.append_chat("You",text)
+        if self.attachments: self.chat.append(f"<i>Attached: {', '.join(Path(x).name for x in self.attachments)}</i>")
+        self.input.clear(); self.attachments=[]; self.update_attachment_label(); self.persist_current(); self.send_btn.setEnabled(False); self.stop_btn.setEnabled(True)
+        self.worker=ChatWorker(list(self.messages),self.model,key,self.agent_mode.isChecked(),self.workspace); self.worker.status.connect(self.statusBar().showMessage); self.worker.activity.connect(self.activity.setText); self.worker.done.connect(self.on_reply); self.worker.failed.connect(self.on_error); self.worker.start()
 
-    def on_reply(self, text):
-        self.messages.append({"role": "assistant", "content": text})
-        self.append_chat("Dots3", text)
-        self.send_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.statusBar().showMessage("Ready")
-        self.worker = None
-
-    def on_error(self, error):
-        self.append_chat("Error", error)
-        self.send_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.statusBar().showMessage("Error")
-        self.worker = None
-
+    def on_reply(self,text): self.messages.append({"role":"assistant","content":text}); self.append_chat("Dots3",text); self.finish_worker("Ready"); self.persist_current()
+    def on_error(self,error): self.append_chat("Error",error); self.finish_worker("Error")
+    def finish_worker(self,status): self.send_btn.setEnabled(True); self.stop_btn.setEnabled(False); self.statusBar().showMessage(status); self.activity.setText(""); self.worker=None
     def stop_worker(self):
-        if self.worker:
-            self.worker.cancelled = True
-            self.stop_btn.setEnabled(False)
-            self.statusBar().showMessage("Stopping after current network request...")
+        if self.worker: self.worker.cancelled=True; self.stop_btn.setEnabled(False); self.statusBar().showMessage("Stopping after current request...")
 
-    def reset_chat(self):
-        self.messages = [self.messages[0]]
-        self.attachments = []
-        self.update_attachment_label()
-        self.render_welcome()
-        self.statusBar().showMessage("New chat")
+    def check_updates_silent(self): self.check_updates(True)
+    def check_updates(self, silent=False):
+        self.update_worker=UpdateWorker(); self.update_worker.found.connect(self.update_found)
+        if not silent: self.update_worker.none.connect(lambda: QMessageBox.information(self,APP_NAME,"You already have the latest Dots3 Desktop version."))
+        self.update_worker.start()
+    def update_found(self, version, url):
+        if QMessageBox.question(self,APP_NAME,f"Dots3 Desktop v{version} is available. Open the installer download now?")==QMessageBox.StandardButton.Yes: webbrowser.open(url)
+
+    def closeEvent(self,event): self.persist_current(); event.accept()
 
 
 def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setStyle("Fusion")
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+    app=QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setOrganizationName("KPFinInv"); w=MainWindow(); w.show(); sys.exit(app.exec())
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
