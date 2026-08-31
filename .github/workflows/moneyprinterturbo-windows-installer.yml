@@ -1,0 +1,66 @@
+name: Build MoneyPrinterTurbo Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - moneyprinterturbo-windows-installer
+    paths:
+      - 'moneyprinterturbo_windows/**'
+      - '.github/workflows/moneyprinterturbo-windows-installer.yml'
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v4
+
+      - name: Download latest official MoneyPrinterTurbo Windows package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path downloads | Out-Null
+          gh release download --repo harry0703/MoneyPrinterTurbo --pattern "MoneyPrinterTurbo-Portable-Windows-*.7z" --dir downloads
+          $archive = Get-ChildItem downloads -Filter "MoneyPrinterTurbo-Portable-Windows-*.7z" | Select-Object -First 1
+          if (-not $archive) { throw "Official Windows portable archive was not found." }
+          Write-Host "Downloaded $($archive.Name)"
+
+      - name: Extract official portable package
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem downloads -Filter "MoneyPrinterTurbo-Portable-Windows-*.7z" | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path mpt-extracted | Out-Null
+          & 7z x $archive.FullName "-ompt-extracted" -y
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed." }
+
+          $start = Get-ChildItem mpt-extracted -Filter start.bat -Recurse | Select-Object -First 1
+          if (-not $start) { throw "start.bat was not found in the official portable package." }
+          $sourceRoot = $start.Directory.FullName
+          Write-Host "Portable app root: $sourceRoot"
+
+          New-Item -ItemType Directory -Force -Path mpt-package | Out-Null
+          Copy-Item "$sourceRoot\*" mpt-package -Recurse -Force
+          if (-not (Test-Path "mpt-package\start.bat")) { throw "Packaging root is invalid." }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build setup EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installer-output | Out-Null
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "moneyprinterturbo_windows\MoneyPrinterTurbo.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed." }
+
+      - name: Upload setup EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoneyPrinterTurbo-Windows-Installer
+          path: installer-output/MoneyPrinterTurbo-Windows-Setup.exe
+          compression-level: 0
+          retention-days: 30
